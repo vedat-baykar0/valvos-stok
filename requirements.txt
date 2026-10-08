@@ -1,0 +1,8 @@
+streamlit==1.40.2
+pandas==2.2.3
+
+# PostgreSQL surucusu.
+# psycopg, psycopg2'nin yeni surumudur (ayni projenin 3. nesli); hazir
+# derlenmis [binary] paketi sayesinde Streamlit Cloud'da ek bir sistem
+# kurulumu gerektirmeden calisir.
+psycopg[binary]==3.3.6
