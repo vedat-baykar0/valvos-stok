@@ -32,8 +32,10 @@ import tema           # noqa: E402
 
 tema.uygula()
 
-# Veritabanını hazırla (her açılışta güvenli, mevcut stoğu bozmaz)
-db.kur()
+# Veritabanını hazırla. kur_bir_kez() sonucu Streamlit tarafından
+# önbelleklenir: şema kurulumu ve kalem tanımları her tıklamada DEĞİL,
+# uygulama ömrü boyunca yalnızca bir kez çalışır (hız için kritik).
+db.kur_bir_kez()
 
 
 # ===========================================================================
@@ -114,8 +116,60 @@ def parca_etiketi(p):
     return bom.parca_adi(p["kategori"], p["varyant"], p["dn"])
 
 
+def bildirim_zili(kritikler):
+    """Sağ üst köşedeki bildirim ikonu (🔔).
+
+    Kritik seviyesi 0'dan büyük olup stoğu bu seviyeye inmiş kalemleri
+    gösterir. Kritik seviyesi 0 olan kalemler takip edilmez, bu yüzden
+    gereksiz uyarı çıkmaz.
+    """
+    adet = len(kritikler)
+    etiket = f"🔔 ({adet})" if adet else "🔔"
+
+    if adet:
+        # Uyarı varken zil KIRMIZI görünür. Renk burada veriliyor çünkü
+        # yalnızca uyarı olduğunda geçerli; tema.py sabit renk vermez.
+        st.markdown(
+            "<style>"
+            '[data-testid="stPopoverButton"]{'
+            "border-color:#DC4C4C !important;"
+            "background:rgba(220,76,76,.16) !important;"
+            "box-shadow:0 0 0 3px rgba(220,76,76,.14);"
+            "}"
+            "</style>",
+            unsafe_allow_html=True,
+        )
+
+    with st.popover(etiket, use_container_width=True):
+        if not adet:
+            st.markdown("##### 🔔 Bildirimler")
+            st.success("Kritik seviyenin altına düşen kalem yok.")
+            st.caption(
+                "Bir kalem için uyarı almak istiyorsanız **⚙️ Ayarlar** "
+                "ekranından o kaleme 0'dan büyük bir kritik seviye girin."
+            )
+        else:
+            st.markdown(f"##### 🔔 {adet} kalem kritik seviyede")
+            st.caption("Stoğu kritik seviyeye inen kalemler — sipariş verilmeli:")
+            for k in kritikler:
+                st.markdown(
+                    f"🔴 **{parca_etiketi(k)}**  \n"
+                    f"&nbsp;&nbsp;&nbsp;&nbsp;Stok: **{k['stok']}** / "
+                    f"Kritik seviye: **{k['kritik_seviye']}**"
+                )
+            st.caption(
+                "Eşikleri **⚙️ Ayarlar > Kritik Stok Seviyeleri** "
+                "ekranından değiştirebilirsiniz."
+            )
+
+
 def parcalar_df(kategori=None):
-    kayitlar = db.parcalar(kategori=kategori)
+    # HIZ: her kategori sekmesi için ayrı sorgu atmak yerine TÜM liste bir kez
+    # (önbellekten) okunup bellekte süzülür. Gösterge panelinde 6 sorgu yerine
+    # 1 sorgu gider.
+    kayitlar = db.parcalar()
+    if kategori:
+        kayitlar = [p for p in kayitlar if p["kategori"] == kategori]
     if not kayitlar:
         return pd.DataFrame()
     df = pd.DataFrame(kayitlar)
@@ -178,6 +232,17 @@ if _ozet["kritik"]:
 else:
     st.sidebar.success("Tüm stoklar yeterli")
 
+# ---------------------------------------------------------------------------
+# ÜST ŞERİT — sağ üstte bildirim zili
+# ---------------------------------------------------------------------------
+# Kritik kalem listesi her ekranda gerekir (zil + gösterge paneli); tek yerde
+# okunup paylaşılır, böylece aynı sorgu iki kez gitmez.
+_kritikler = db.kritik_parcalar()
+
+_bos, _ust_sag = st.columns([6, 1])
+with _ust_sag:
+    bildirim_zili(_kritikler)
+
 # Fabrika şifresi hâlâ kullanılıyorsa her ekranda hatırlat
 if KULLANICI.get("varsayilan_sifre"):
     st.warning(
@@ -201,7 +266,7 @@ if sayfa == "📊 Gösterge Paneli":
     k3.metric("Üretilen Vana", f"{_ozet['uretilen_adet']} adet")
     k4.metric("Üretim Kaydı", _ozet["uretim_kaydi"])
 
-    kritikler = db.kritik_parcalar()
+    kritikler = _kritikler          # üst şeritte zaten okundu
     if kritikler:
         with st.expander(f"⚠️ Kritik seviyedeki {len(kritikler)} kalem (sipariş verilmeli)", expanded=True):
             kdf = pd.DataFrame(kritikler)
@@ -610,8 +675,10 @@ elif sayfa == "⚙️ Ayarlar":
 
     st.subheader("🔔 Kritik Stok Seviyeleri")
     st.caption(
-        "Stok bu değere veya altına düştüğünde gösterge panelinde kırmızı uyarı çıkar. "
-        "Değiştirmek için hücreye yazıp kaydet'e bas."
+        "Stok bu değere veya altına düştüğünde sağ üstteki 🔔 bildirim zilinde "
+        "ve gösterge panelinde kırmızı uyarı çıkar. "
+        "**0 = o kalem için uyarı istemiyorum** (varsayılan). "
+        "Değiştirmek için hücreye yazıp kaydet'e basın."
     )
     kategori_ad = st.selectbox(
         "Kategori", [bom.kategori_adi(k) for k in bom.KATEGORI_SIRASI], key="ayar_kat"
@@ -879,7 +946,7 @@ elif sayfa == "🛡️ Sistem Yönetimi":
             o1, o2, o3 = st.columns(3)
             o1.metric("Silinecek Üretim Kaydı", _ozet["uretim_kaydi"])
             o2.metric("Sıfırlanacak Stok", f"{_ozet['toplam_stok']} adet")
-            o3.metric("Hareket Kaydı", len(db.hareketler(100000)))
+            o3.metric("Hareket Kaydı", db.hareket_sayisi())
 
             onay_metni = st.text_input(
                 "İşlemi onaylamak için aşağıdaki kutuya büyük harflerle "
