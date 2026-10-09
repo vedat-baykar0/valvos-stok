@@ -27,6 +27,7 @@ from contextlib import contextmanager
 from datetime import datetime
 
 import psycopg
+import streamlit as st
 from psycopg.rows import dict_row
 
 import bom
@@ -80,6 +81,27 @@ def veri_kaynagi():
     # postgresql://kullanici:SIFRE@sunucu/veritabani?... -> sunucu/veritabani
     kalan = url.split("@")[-1].split("?")[0]
     return "PostgreSQL (bulut): %s" % kalan
+
+
+# ---------------------------------------------------------------------------
+# ONBELLEK (CACHE) - HIZ
+# ---------------------------------------------------------------------------
+# Streamlit her tiklamada bu dosyayi bastan calistirir. Bulut veritabanina her
+# seferinde yeniden sorgu gondermek (her sorgu ~50-200 ms) arayuzu agirlastirir.
+# Bu yuzden SADECE OKUMA yapan fonksiyonlarin sonucu kisa sure bellekte
+# tutulur; yazma islemlerinden hemen sonra onbellek temizlenir, boylece
+# kullanici yaptigi degisikligi aninda gorur.
+
+ONBELLEK_SURESI = 10          # saniye
+
+
+def _onbellek_temizle():
+    """Yazma islemlerinden sonra cagrilir: okuma onbellegini gecersiz kilar."""
+    try:
+        st.cache_data.clear()
+    except Exception:
+        # Streamlit baglami disinda (or. test betigi) calisiyorsa sorun degil
+        pass
 
 
 def _simdi():
@@ -244,8 +266,13 @@ CREATE TABLE IF NOT EXISTS parcalar (
     varyant       TEXT    NOT NULL,
     dn            INTEGER NOT NULL,
     stok          INTEGER NOT NULL DEFAULT 0,
-    kritik_seviye INTEGER NOT NULL DEFAULT 5,
+    kritik_seviye INTEGER NOT NULL DEFAULT 0,
     UNIQUE (kategori, varyant, dn)
+);
+
+CREATE TABLE IF NOT EXISTS ayarlar (
+    anahtar TEXT PRIMARY KEY,
+    deger   TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS uretimler (
@@ -290,6 +317,12 @@ CREATE INDEX IF NOT EXISTS ix_uretim_tarih   ON uretimler(tarih DESC)
 """
 
 
+# Tek seferlik veri düzeltmeleri. Anahtar "ayarlar" tablosuna yazılır; aynı
+# düzeltme ikinci kez ASLA çalışmaz, böylece kullanıcının sonradan elle girdiği
+# değerler bozulmaz.
+KRITIK_SIFIRLAMA_ANAHTARI = "kritik_seviye_sifirlandi_v1"
+
+
 def kur():
     """Tabloları oluşturur ve bom.py'de tanımlı eksik kalemleri 0 stokla ekler.
 
@@ -303,9 +336,41 @@ def kur():
             " VALUES (?, ?, ?, 0) ON CONFLICT DO NOTHING",
             bom.tum_parca_tanimlari(),
         )
+
+        # Daha önce oluşturulmuş tablolarda sütun varsayılanını da 0'a çek
+        conn.execute("ALTER TABLE parcalar ALTER COLUMN kritik_seviye SET DEFAULT 0")
+
+        # TEK SEFERLİK: mevcut tüm parçaların kritik seviyesini 0'a indir.
+        # Kullanıcı bundan sonra Ayarlar ekranından istediği kalemlere kendi
+        # eşiğini girer; bu blok bir daha ASLA çalışmaz.
+        yapildi = conn.execute(
+            "SELECT 1 FROM ayarlar WHERE anahtar = ?", (KRITIK_SIFIRLAMA_ANAHTARI,)
+        ).fetchone()
+        if not yapildi:
+            conn.execute("UPDATE parcalar SET kritik_seviye = 0")
+            conn.execute(
+                "INSERT INTO ayarlar (anahtar, deger) VALUES (?, ?)"
+                " ON CONFLICT (anahtar) DO NOTHING",
+                (KRITIK_SIFIRLAMA_ANAHTARI, _simdi()),
+            )
+
         conn.islem_bitir()
 
     _varsayilan_kullanicilar()
+    _onbellek_temizle()
+
+
+@st.cache_resource(show_spinner=False)
+def kur_bir_kez():
+    """kur() işlemini uygulama ömrü boyunca SADECE BİR KEZ çalıştırır.
+
+    Şema kurulumunu ve yüzlerce satırlık kalem ekleme sorgusunu her tıklamada
+    tekrarlamak arayüzün en büyük yavaşlama sebebiydi. Streamlit bu fonksiyonun
+    sonucunu sunucu belleğinde tuttuğu için işlem yalnızca uygulama ilk
+    açıldığında yapılır.
+    """
+    kur()
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -394,6 +459,7 @@ def kullanici_dogrula(kullanici_adi, sifre):
         }
 
 
+@st.cache_data(ttl=ONBELLEK_SURESI, show_spinner=False)
 def kullanicilar_listesi():
     with baglanti() as conn:
         return [
@@ -426,6 +492,7 @@ def sifre_degistir(kullanici_id, yeni_sifre, eski_sifre=None):
             (_sifre_hashle(yeni_sifre), kullanici_id),
         )
         conn.islem_bitir()
+    _onbellek_temizle()
     return True, "Şifre güncellendi."
 
 
@@ -451,6 +518,7 @@ def kullanici_ekle(kullanici_adi, sifre, rol):
             (kullanici_adi, _sifre_hashle(sifre), rol),
         )
         conn.islem_bitir()
+    _onbellek_temizle()
     return True, "'%s' kullanıcısı eklendi." % kullanici_adi
 
 
@@ -478,6 +546,7 @@ def kullanici_sil(kullanici_id, isteyen_id=None):
                 return False, "Son yönetici hesabı silinemez — sisteme giremezsiniz."
         conn.execute("DELETE FROM kullanicilar WHERE id = ?", (kullanici_id,))
         conn.islem_bitir()
+    _onbellek_temizle()
     return True, "'%s' kullanıcısı silindi." % r["kullanici_adi"]
 
 
@@ -500,6 +569,7 @@ def veritabani_sifirla():
         conn.execute("ALTER SEQUENCE hareketler_id_seq RESTART WITH 1")
         conn.execute("ALTER SEQUENCE uretimler_id_seq RESTART WITH 1")
         conn.islem_bitir()
+    _onbellek_temizle()
     return yedek
 
 
@@ -507,6 +577,7 @@ def veritabani_sifirla():
 # OKUMA
 # ---------------------------------------------------------------------------
 
+@st.cache_data(ttl=ONBELLEK_SURESI, show_spinner=False)
 def parcalar(kategori=None, dn=None):
     """Hammadde listesi (stok durumu ile)."""
     sql = "SELECT * FROM parcalar WHERE 1=1"
@@ -522,6 +593,7 @@ def parcalar(kategori=None, dn=None):
         return [dict(r) for r in conn.execute(sql, args).fetchall()]
 
 
+@st.cache_data(ttl=ONBELLEK_SURESI, show_spinner=False)
 def parca_getir(kategori, varyant, dn):
     with baglanti() as conn:
         r = conn.execute(
@@ -532,17 +604,28 @@ def parca_getir(kategori, varyant, dn):
 
 
 def kritik_parcalar():
-    """Stoğu kritik seviyenin altına düşmüş kalemler."""
-    with baglanti() as conn:
-        return [
-            dict(r)
-            for r in conn.execute(
-                "SELECT * FROM parcalar WHERE stok <= kritik_seviye "
-                "ORDER BY (stok - kritik_seviye), kategori, dn"
-            ).fetchall()
-        ]
+    """Stoğu kritik seviyeye inmiş (veya altına düşmüş) kalemler.
+
+    Kritik seviyesi 0 olan kalemler TAKİP EDİLMEZ: 0, "bu kalem için uyarı
+    istemiyorum" anlamına gelir. Hangi kaleme hangi eşiğin konacağını kullanıcı
+    Ayarlar ekranından kendisi belirler.
+
+    HIZ: ayrı bir sorgu GÖNDERMEZ — parcalar() zaten önbellekte olduğu için
+    liste bellekte süzülür. Bildirim zili her ekranda çalıştığı için bu önemli.
+    """
+    kritikler = [
+        p
+        for p in parcalar()
+        if p["kritik_seviye"] > 0 and p["stok"] <= p["kritik_seviye"]
+    ]
+    # En kötü durumdaki kalem en üstte
+    kritikler.sort(
+        key=lambda p: (p["stok"] - p["kritik_seviye"], p["kategori"], p["dn"])
+    )
+    return kritikler
 
 
+@st.cache_data(ttl=ONBELLEK_SURESI, show_spinner=False)
 def uretimler(limit=200):
     with baglanti() as conn:
         return [
@@ -553,6 +636,16 @@ def uretimler(limit=200):
         ]
 
 
+@st.cache_data(ttl=ONBELLEK_SURESI, show_spinner=False)
+def hareket_sayisi():
+    """Toplam stok hareketi sayısı (binlerce satırı çekmeden)."""
+    with baglanti() as conn:
+        return int(
+            conn.execute("SELECT COUNT(*) AS adet FROM hareketler").fetchone()["adet"]
+        )
+
+
+@st.cache_data(ttl=ONBELLEK_SURESI, show_spinner=False)
 def hareketler(limit=500, uretim_id=None):
     sql = (
         "SELECT h.*, p.kategori, p.varyant, p.dn "
@@ -568,26 +661,28 @@ def hareketler(limit=500, uretim_id=None):
         return [dict(r) for r in conn.execute(sql, args).fetchall()]
 
 
+@st.cache_data(ttl=ONBELLEK_SURESI, show_spinner=False)
 def ozet():
-    """Gösterge paneli üst satırı için toplam sayılar."""
+    """Gösterge paneli üst satırı için toplam sayılar.
+
+    Dört ayrı sorgu yerine TEK sorgu gönderilir: bulut veritabanıyla her gidiş
+    dönüş zaman kaybı olduğu için bu fark arayüzde doğrudan hissedilir.
+    """
     with baglanti() as conn:
-        toplam_stok = conn.execute(
-            "SELECT COALESCE(SUM(stok), 0) AS deger FROM parcalar"
-        ).fetchone()["deger"]
-        kritik = conn.execute(
-            "SELECT COUNT(*) AS deger FROM parcalar WHERE stok <= kritik_seviye"
-        ).fetchone()["deger"]
-        uretim_adet = conn.execute(
-            "SELECT COALESCE(SUM(adet), 0) AS deger FROM uretimler WHERE iptal = 0"
-        ).fetchone()["deger"]
-        uretim_kayit = conn.execute(
-            "SELECT COUNT(*) AS deger FROM uretimler WHERE iptal = 0"
-        ).fetchone()["deger"]
+        r = conn.execute(
+            "SELECT"
+            " (SELECT COALESCE(SUM(stok), 0) FROM parcalar) AS toplam_stok,"
+            " (SELECT COUNT(*) FROM parcalar"
+            "    WHERE kritik_seviye > 0 AND stok <= kritik_seviye) AS kritik,"
+            " (SELECT COALESCE(SUM(adet), 0) FROM uretimler"
+            "    WHERE iptal = 0) AS uretilen_adet,"
+            " (SELECT COUNT(*) FROM uretimler WHERE iptal = 0) AS uretim_kaydi"
+        ).fetchone()
     return {
-        "toplam_stok": int(toplam_stok),
-        "kritik": int(kritik),
-        "uretilen_adet": int(uretim_adet),
-        "uretim_kaydi": int(uretim_kayit),
+        "toplam_stok": int(r["toplam_stok"]),
+        "kritik": int(r["kritik"]),
+        "uretilen_adet": int(r["uretilen_adet"]),
+        "uretim_kaydi": int(r["uretim_kaydi"]),
     }
 
 
@@ -616,6 +711,7 @@ def stok_girisi(parca_id, adet, aciklama=""):
             (_simdi(), parca_id, adet, onceki, sonraki, aciklama),
         )
         conn.islem_bitir()
+    _onbellek_temizle()
     return sonraki
 
 
@@ -639,6 +735,7 @@ def stok_duzeltme(parca_id, yeni_stok, aciklama=""):
             (_simdi(), parca_id, yeni_stok - onceki, onceki, yeni_stok, aciklama),
         )
         conn.islem_bitir()
+    _onbellek_temizle()
     return yeni_stok
 
 
@@ -651,48 +748,69 @@ def kritik_seviye_ayarla(parca_id, seviye):
             "UPDATE parcalar SET kritik_seviye = ? WHERE id = ?", (seviye, parca_id)
         )
         conn.islem_bitir()
+    _onbellek_temizle()
 
 
 # ---------------------------------------------------------------------------
 # YAZMA — ÜRÜN ÇIKIŞI (REÇETE DÜŞÜMÜ)
 # ---------------------------------------------------------------------------
 
+def _kalem_stoklari(kalemler):
+    """Reçete kalemlerinin (id, stok) bilgisini TEK sorguda getirir.
+
+    Dönüş: {(kategori, varyant, dn): {"id": .., "stok": ..}}
+    Eskiden 5 kalem için 5 ayrı sorgu gidiyordu; bulutta bu, beş kat gecikme
+    anlamına geliyordu.
+    """
+    if not kalemler:
+        return {}
+    anahtarlar = [(k["kategori"], k["varyant"], k["dn"]) for k in kalemler]
+    yer_tutucu = ", ".join(["(?, ?, ?)"] * len(anahtarlar))
+    args = [deger for anahtar in anahtarlar for deger in anahtar]
+    with baglanti() as conn:
+        satirlar = conn.execute(
+            "SELECT id, kategori, varyant, dn, stok FROM parcalar"
+            " WHERE (kategori, varyant, dn) IN (" + yer_tutucu + ")",
+            args,
+        ).fetchall()
+    return {
+        (r["kategori"], r["varyant"], r["dn"]): {"id": r["id"], "stok": r["stok"]}
+        for r in satirlar
+    }
+
+
+@st.cache_data(ttl=ONBELLEK_SURESI, show_spinner=False)
 def uretilebilir_adet(dn, conta, klepe, kontrol):
     """Mevcut stokla bu konfigürasyondan en fazla kaç adet üretilebilir."""
     kalemler = bom.recete(dn, conta, klepe, kontrol, 1)
-    stoklar = []
-    with baglanti() as conn:
-        for k in kalemler:
-            r = conn.execute(
-                "SELECT stok FROM parcalar WHERE kategori=? AND varyant=? AND dn=?",
-                (k["kategori"], k["varyant"], k["dn"]),
-            ).fetchone()
-            stoklar.append(r["stok"] if r else 0)
+    harita = _kalem_stoklari(kalemler)
+    stoklar = [
+        harita.get((k["kategori"], k["varyant"], k["dn"]), {}).get("stok", 0)
+        for k in kalemler
+    ]
     return max(0, min(stoklar)) if stoklar else 0
 
 
+@st.cache_data(ttl=ONBELLEK_SURESI, show_spinner=False)
 def recete_durumu(dn, conta, klepe, kontrol, adet):
     """Düşüm yapmadan önce reçeteyi ve stok yeterliliğini gösterir."""
     kalemler = bom.recete(dn, conta, klepe, kontrol, adet)
+    harita = _kalem_stoklari(kalemler)
     sonuc = []
-    with baglanti() as conn:
-        for k in kalemler:
-            r = conn.execute(
-                "SELECT id, stok FROM parcalar WHERE kategori=? AND varyant=? AND dn=?",
-                (k["kategori"], k["varyant"], k["dn"]),
-            ).fetchone()
-            mevcut = r["stok"] if r else 0
-            kayit = dict(k)
-            kayit.update(
-                {
-                    "parca_id": r["id"] if r else None,
-                    "mevcut_stok": mevcut,
-                    "kalan_stok": mevcut - k["adet"],
-                    "yeterli": mevcut >= k["adet"],
-                    "eksik": max(0, k["adet"] - mevcut),
-                }
-            )
-            sonuc.append(kayit)
+    for k in kalemler:
+        bilgi = harita.get((k["kategori"], k["varyant"], k["dn"]))
+        mevcut = bilgi["stok"] if bilgi else 0
+        kayit = dict(k)
+        kayit.update(
+            {
+                "parca_id": bilgi["id"] if bilgi else None,
+                "mevcut_stok": mevcut,
+                "kalan_stok": mevcut - k["adet"],
+                "yeterli": mevcut >= k["adet"],
+                "eksik": max(0, k["adet"] - mevcut),
+            }
+        )
+        sonuc.append(kayit)
     return sonuc
 
 
@@ -767,6 +885,7 @@ def uretim_yap(dn, conta, klepe, kontrol, adet, musteri="", aciklama=""):
 
         conn.islem_bitir()
 
+    _onbellek_temizle()
     return True, "%d adet '%s' kaydedildi, 5 kalem stoktan düşüldü." % (adet, ad), detay
 
 
@@ -819,6 +938,7 @@ def uretim_iptal(uretim_id):
         conn.execute("UPDATE uretimler SET iptal = 1 WHERE id = ?", (uretim_id,))
         conn.islem_bitir()
 
+    _onbellek_temizle()
     return True, "#%d iptal edildi, hammaddeler stoka geri eklendi." % uretim_id
 
 
@@ -840,6 +960,9 @@ _YEDEK_TABLOLARI = [
          "uretim_id", "aciklama"],
     ),
     ("kullanicilar", ["id", "kullanici_adi", "sifre", "rol", "son_giris"]),
+    # Tek seferlik veri duzeltmelerinin kaydi; yedekten geri yuklenirken de
+    # tasinmasi gerekir, aksi halde duzeltme ikinci kez calisabilir.
+    ("ayarlar", ["anahtar", "deger"]),
 ]
 
 
@@ -905,7 +1028,8 @@ def yedek_al():
 
         for tablo, kolonlar in _YEDEK_TABLOLARI:
             satirlar = conn.execute(
-                "SELECT %s FROM %s ORDER BY id" % (", ".join(kolonlar), tablo)
+                "SELECT %s FROM %s ORDER BY %s"
+                % (", ".join(kolonlar), tablo, kolonlar[0])
             ).fetchall()
             dosya.write("-- %s (%d kayıt)\n" % (tablo, len(satirlar)))
             for r in satirlar:
@@ -922,7 +1046,10 @@ def yedek_al():
 
         # id sayaçlarını en büyük id'nin üstüne taşı
         dosya.write("-- Kimlik sayaçlarını güncelle\n")
-        for tablo, _ in _YEDEK_TABLOLARI:
+        for tablo, kolonlar in _YEDEK_TABLOLARI:
+            # Otomatik artan id'si olmayan tablolarda (or. ayarlar) sayac yok
+            if "id" not in kolonlar:
+                continue
             dosya.write(
                 "SELECT setval('%s_id_seq',"
                 " COALESCE((SELECT MAX(id) FROM %s), 1));\n" % (tablo, tablo)

@@ -97,6 +97,10 @@ def _giris_ekrani():
                     f"Kalan deneme hakkı: {kalan_hak}"
                 )
 
+        st.caption(
+            "🎨 Aydınlık / karanlık tema: sağ üstteki **⋮** → **Settings** → "
+            "**Theme**"
+        )
         tema.dipnot("Valvos Vana Sanayi · Yetkisiz erişim yasaktır")
 
 
@@ -231,6 +235,15 @@ if _ozet["kritik"]:
     st.sidebar.error(f"⚠️ {_ozet['kritik']} kalem kritik seviyede")
 else:
     st.sidebar.success("Tüm stoklar yeterli")
+
+# Tema seçimi Streamlit'in kendi menüsünde; koddan değiştirilemez, bu yüzden
+# kullanıcıya nerede olduğu söylenir.
+st.sidebar.divider()
+st.sidebar.caption(
+    "🎨 **Tema:** sağ üstteki **⋮** düğmesi → **Settings** → **Theme** "
+    "bölümünden *Light* (aydınlık) veya *Dark* (karanlık) seçebilirsiniz. "
+    "Yazılar her iki temada da okunur."
+)
 
 # ---------------------------------------------------------------------------
 # ÜST ŞERİT — sağ üstte bildirim zili
